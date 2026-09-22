@@ -1,0 +1,15 @@
+kind = "solution"
+spec = "polynomial-multiplication/negacyclic@1.0.0"
+
+[entry]
+init = "fherma_init"
+run  = "fherma_run"
+free = "fherma_free"
+
+[build]
+command = "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build"
+
+[runtime]
+language = "cpp"
+
+run = "./build/solution"
