@@ -28,3 +28,6 @@ to answer early.
 
 Every file but the one above carries a header saying so. They are rewritten
 by `fherma implementation init --update`, which never touches yours.
+
+
+Clone URL: https://github.com/engelstands-hue/engel-cuda-negacyclic-multiply
