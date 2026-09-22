@@ -1,0 +1,11 @@
+spec negacyclic 1.0.0 "Negacyclic ring, wide prime modulus" {
+    kernel polymul<
+        N: u32,
+        W: u32,
+        L: u32 = (W + 31) / 32,
+        q: tensor<L x u32> (N, W),
+    >(
+        %a: tensor<N x L x u32>,
+        %b: tensor<N x L x u32>,
+    ) -> %c: tensor<N x L x u32>
+}
