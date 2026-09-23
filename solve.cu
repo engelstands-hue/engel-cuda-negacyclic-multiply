@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +39,11 @@ struct State {
     uint64_t* d_b = nullptr;
     uint64_t* d_tw_fwd = nullptr;
     uint64_t* d_tw_inv = nullptr;
+    uint64_t* d_tw_fwd_shoup = nullptr;
+    uint64_t* d_tw_inv_shoup = nullptr;
+    uint32_t* h_pin_a = nullptr;
+    uint32_t* h_pin_b = nullptr;
+    uint32_t* h_pin_c = nullptr;
     uint64_t* d_psi = nullptr;
     uint64_t* d_psi_inv = nullptr;
     uint32_t* d_in = nullptr;
@@ -139,6 +145,14 @@ __host__ __device__ uint64_t mont_mul(uint64_t a, uint64_t b, uint64_t p, uint64
     if (reduced >= p) reduced -= p;
     if (reduced >= p) reduced -= p;
     return reduced;
+}
+
+// Primes here sit under 2^62, so floor(w * 2^64 / p) makes one correction exact.
+__device__ __forceinline__ uint64_t shoup_mul(uint64_t a, uint64_t w, uint64_t w_shoup, uint64_t p) {
+    const uint64_t q = __umul64hi(a, w_shoup);
+    uint64_t r = a * w - q * p;
+    if (r >= p) r -= p;
+    return r;
 }
 
 __host__ __device__ uint64_t barrett_reduce(uint64_t v_hi, uint64_t v_lo, uint64_t p, uint64_t mu) {
@@ -357,6 +371,85 @@ __host__ __device__ int top_bit(const uint32_t* value, int wide) {
     return -1;
 }
 
+// floor(2^(868+128) / q) brings a number up to 96 bits past q down with one correction.
+__host__ __device__ void mod_q_barrett(uint32_t* acc, const uint32_t* q, const uint32_t* mu, int q_limbs) {
+    uint32_t shifted[8] = {};
+    for (int i = 0; i < 7; ++i) {
+        const uint32_t low = acc[27 + i];
+        const uint32_t high = (28 + i < kCrtLimbs) ? acc[28 + i] : 0u;
+        shifted[i] = (low >> 4) | (high << 28);
+    }
+    uint32_t digits[16] = {};
+    for (int i = 0; i < 7; ++i) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 5; ++j) {
+            const uint64_t cur = static_cast<uint64_t>(digits[i + j]) + static_cast<uint64_t>(shifted[i]) * mu[j] + carry;
+            digits[i + j] = static_cast<uint32_t>(cur);
+            carry = cur >> 32;
+        }
+        for (int k = i + 5; carry != 0 && k < 16; ++k) {
+            const uint64_t cur = static_cast<uint64_t>(digits[k]) + carry;
+            digits[k] = static_cast<uint32_t>(cur);
+            carry = cur >> 32;
+        }
+    }
+    uint32_t prod[kCrtLimbs + 8] = {};
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t factor = digits[4 + i];
+        if (factor == 0) continue;
+        uint64_t column = 0;
+        for (int limb = 0; limb < q_limbs; ++limb) {
+            const int at = limb + i;
+            if (at >= kCrtLimbs + 8) break;
+            const uint64_t cur = static_cast<uint64_t>(prod[at]) + static_cast<uint64_t>(q[limb]) * factor + column;
+            prod[at] = static_cast<uint32_t>(cur);
+            column = cur >> 32;
+        }
+        const int tail = q_limbs + i;
+        if (column != 0 && tail < kCrtLimbs + 8) prod[tail] = static_cast<uint32_t>(prod[tail] + column);
+    }
+    uint32_t borrow = 0;
+    for (int limb = 0; limb < kCrtLimbs; ++limb) {
+        const uint64_t right = static_cast<uint64_t>(prod[limb]) + borrow;
+        if (acc[limb] < right) {
+            acc[limb] = static_cast<uint32_t>(static_cast<uint64_t>(acc[limb]) + (1ull << 32) - right);
+            borrow = 1;
+        } else {
+            acc[limb] = static_cast<uint32_t>(acc[limb] - right);
+            borrow = 0;
+        }
+    }
+    if (borrow) {
+        uint32_t add_carry = 0;
+        for (int limb = 0; limb < q_limbs; ++limb) {
+            const uint64_t sum = static_cast<uint64_t>(acc[limb]) + q[limb] + add_carry;
+            acc[limb] = static_cast<uint32_t>(sum);
+            add_carry = sum >> 32;
+        }
+    }
+    for (int fix = 0; fix < 2; ++fix) {
+        bool greater_or_equal = true;
+        for (int limb = kCrtLimbs - 1; limb >= 0; --limb) {
+            const uint32_t q_limb = limb < q_limbs ? q[limb] : 0u;
+            if (acc[limb] == q_limb) continue;
+            greater_or_equal = acc[limb] > q_limb;
+            break;
+        }
+        if (!greater_or_equal) break;
+        borrow = 0;
+        for (int limb = 0; limb < kCrtLimbs; ++limb) {
+            const uint64_t right = static_cast<uint64_t>(limb < q_limbs ? q[limb] : 0u) + borrow;
+            if (acc[limb] < right) {
+                acc[limb] = static_cast<uint32_t>(static_cast<uint64_t>(acc[limb]) + (1ull << 32) - right);
+                borrow = 1;
+            } else {
+                acc[limb] = static_cast<uint32_t>(acc[limb] - right);
+                borrow = 0;
+            }
+        }
+    }
+}
+
 __host__ __device__ void mod_q(uint32_t* acc, const uint32_t* q, int q_limbs, int wide) {
     const int q_top = top_bit(q, q_limbs);
     int acc_top = top_bit(acc, wide);
@@ -507,7 +600,7 @@ __global__ void bitrev_kernel(uint64_t* data, int n, int bits, int channels) {
 }
 
 __global__ void stage_kernel(
-    uint64_t* data, const uint64_t* twiddles, const uint64_t* primes, const uint64_t* nprime,
+    uint64_t* data, const uint64_t* twiddles, const uint64_t* shoups, const uint64_t* primes,
     int n, int half, int tw_base, int channels) {
     const int butterfly = blockIdx.x * blockDim.x + threadIdx.x;
     const int channel = blockIdx.y;
@@ -516,9 +609,10 @@ __global__ void stage_kernel(
     const int start = (butterfly / half) * (half * 2);
     const uint64_t prime = primes[channel];
     uint64_t* row = data + static_cast<size_t>(channel) * n;
-    const uint64_t twiddle = twiddles[static_cast<size_t>(channel) * n + tw_base + lane];
+    const int tw_at = tw_base + lane;
+    const size_t channel_at = static_cast<size_t>(channel) * n + tw_at;
     const uint64_t left = row[start + lane];
-    const uint64_t right = mont_mul(row[start + lane + half], twiddle, prime, nprime[channel]);
+    const uint64_t right = shoup_mul(row[start + lane + half], twiddles[channel_at], shoups[channel_at], prime);
     row[start + lane] = add_mod(left, right, prime);
     row[start + lane + half] = sub_mod(left, right, prime);
 }
@@ -688,12 +782,14 @@ __global__ void fast_crt_kernel(
     (void)sign_certain;
     (void)unsafe_count;
     (void)unsafe_index;
-    mod_q(acc, q, limbs, kCrtLimbs);
+    if (limbs == 28) mod_q_barrett(acc, q, q_mu, limbs);
+    else mod_q(acc, q, limbs, kCrtLimbs);
     uint32_t multiple[kCrtLimbs];
 #pragma unroll
     for (int limb = 0; limb < kCrtLimbs; ++limb) multiple[limb] = 0;
     accum_factor(multiple, m_mod_q, sum_hi);
-    mod_q(multiple, q, limbs, kCrtLimbs);
+    if (limbs == 28) mod_q_barrett(multiple, q, q_mu, limbs);
+    else mod_q(multiple, q, limbs, kCrtLimbs);
     uint32_t borrow = 0;
     for (int limb = 0; limb < limbs; ++limb) {
         const uint64_t left = acc[limb];
@@ -810,7 +906,7 @@ __global__ void crt_kernel(
 }
 
 __global__ void radix8_kernel(
-    uint64_t* data, const uint64_t* twiddles, const uint64_t* primes, const uint64_t* nprime,
+    uint64_t* data, const uint64_t* twiddles, const uint64_t* shoups, const uint64_t* primes,
     int n, int stride, int channels, int bits, int first) {
     const int id = blockIdx.x * blockDim.x + threadIdx.x;
     const int channel = blockIdx.y;
@@ -819,9 +915,9 @@ __global__ void radix8_kernel(
     const int offset = id - group * stride;
     const int base = group * (stride << 3);
     const uint64_t prime = primes[channel];
-    const uint64_t np = nprime[channel];
     uint64_t* row = data + static_cast<size_t>(channel) * n;
     const uint64_t* twiddle_row = twiddles + static_cast<size_t>(channel) * n;
+    const uint64_t* shoup_row = shoups + static_cast<size_t>(channel) * n;
 
     uint64_t value[8];
 #pragma unroll
@@ -839,9 +935,9 @@ __global__ void radix8_kernel(
 #pragma unroll
             for (int lane = 0; lane < dist; ++lane) {
                 const int global_lane = offset + lane * stride;
-                const uint64_t twiddle = twiddle_row[(global_half - 1) + global_lane];
+                const int tw_at = (global_half - 1) + global_lane;
                 const uint64_t left = value[start + lane];
-                const uint64_t right = mont_mul(value[start + lane + dist], twiddle, prime, np);
+                const uint64_t right = shoup_mul(value[start + lane + dist], twiddle_row[tw_at], shoup_row[tw_at], prime);
                 value[start + lane] = add_mod(left, right, prime);
                 value[start + lane + dist] = sub_mod(left, right, prime);
             }
@@ -851,40 +947,64 @@ __global__ void radix8_kernel(
     for (int lane = 0; lane < 8; ++lane) row[base + offset + lane * stride] = value[lane];
 }
 
-// After bit reversal, butterfly groups of size 4096 never leave a 4096-word tile
-// until half reaches 2048. One shared-memory pass covers those twelve rounds.
+// The first twelve rounds stay inside a 4096-word tile. Bit reversal is the load.
+// Four radix-8 rounds replace twelve synced radix-2 passes.
 __global__ void ntt_tile_kernel(
-    uint64_t* data, const uint64_t* twiddles, const uint64_t* primes, const uint64_t* nprime,
+    uint64_t* data, const uint64_t* twiddles, const uint64_t* shoups, const uint64_t* primes,
     int n, int channels) {
     constexpr int kTile = 4096;
     __shared__ uint64_t tile[kTile];
     const int tile_id = blockIdx.x;
     const int channel = blockIdx.y;
     if (channel >= channels || tile_id >= n / kTile) return;
-    uint64_t* row = data + (static_cast<size_t>(channel) * n) + static_cast<size_t>(tile_id) * kTile;
+    int bits = 0;
+    for (int value = n; value > 1; value >>= 1) ++bits;
+    uint64_t* row = data + static_cast<size_t>(channel) * n;
     const uint64_t* twiddle_row = twiddles + static_cast<size_t>(channel) * n;
+    const uint64_t* shoup_row = shoups + static_cast<size_t>(channel) * n;
     const uint64_t prime = primes[channel];
-    const uint64_t np = nprime[channel];
-    for (int item = threadIdx.x; item < kTile; item += blockDim.x) tile[item] = row[item];
+    for (int item = threadIdx.x; item < kTile; item += blockDim.x) {
+        const int global = tile_id * kTile + item;
+        const int src = static_cast<int>(__brev(static_cast<unsigned int>(global)) >> (32 - bits));
+        tile[item] = row[src];
+    }
     __syncthreads();
-    for (int half = 1; half < kTile; half <<= 1) {
-        const int groups = kTile / (half * 2);
-        for (int butterfly = threadIdx.x; butterfly < groups * half; butterfly += blockDim.x) {
-            const int lane = butterfly % half;
-            const int start = (butterfly / half) * (half * 2);
-            const uint64_t twiddle = twiddle_row[(half - 1) + lane];
-            const uint64_t left = tile[start + lane];
-            const uint64_t right = mont_mul(tile[start + lane + half], twiddle, prime, np);
-            tile[start + lane] = add_mod(left, right, prime);
-            tile[start + lane + half] = sub_mod(left, right, prime);
+    for (int stride = 1; stride < kTile; stride <<= 3) {
+        const int groups = kTile / (stride * 8);
+        for (int id = threadIdx.x; id < groups * stride; id += blockDim.x) {
+            const int group = id / stride;
+            const int offset = id - group * stride;
+            const int base = group * (stride << 3);
+            uint64_t value[8];
+#pragma unroll
+            for (int lane = 0; lane < 8; ++lane) value[lane] = tile[base + offset + lane * stride];
+#pragma unroll
+            for (int stage = 0; stage < 3; ++stage) {
+                const int dist = 1 << stage;
+                const int global_half = stride << stage;
+#pragma unroll
+                for (int start = 0; start < 8; start += dist * 2) {
+#pragma unroll
+                    for (int lane = 0; lane < dist; ++lane) {
+                        const int tw_at = (global_half - 1) + offset + lane * stride;
+                        const uint64_t left = value[start + lane];
+                        const uint64_t right = shoup_mul(
+                            value[start + lane + dist], twiddle_row[tw_at], shoup_row[tw_at], prime);
+                        value[start + lane] = add_mod(left, right, prime);
+                        value[start + lane + dist] = sub_mod(left, right, prime);
+                    }
+                }
+            }
+#pragma unroll
+            for (int lane = 0; lane < 8; ++lane) tile[base + offset + lane * stride] = value[lane];
         }
         __syncthreads();
     }
-    for (int item = threadIdx.x; item < kTile; item += blockDim.x) row[item] = tile[item];
+    for (int item = threadIdx.x; item < kTile; item += blockDim.x) row[tile_id * kTile + item] = tile[item];
 }
 
 void forward_ntt(
-    uint64_t* data, const uint64_t* twiddles, const uint64_t* primes, const uint64_t* nprime,
+    uint64_t* data, const uint64_t* twiddles, const uint64_t* shoups, const uint64_t* primes,
     int n, int channels) {
     const int threads = 128;
     int bits = 0;
@@ -894,33 +1014,33 @@ void forward_ntt(
         for (int half = 1; half < n; half <<= 1) {
             const int butterflies = n / 2;
             stage_kernel<<<dim3((butterflies + threads - 1) / threads, channels), threads>>>(
-                data, twiddles, primes, nprime, n, half, half - 1, channels);
+                data, twiddles, shoups, primes, n, half, half - 1, channels);
         }
         return;
     }
-    // Bit reversal is its own pass. Folding it into the first load races.
-    bitrev_kernel<<<dim3((n + threads - 1) / threads, channels), threads>>>(data, n, bits, channels);
     int stride = 1;
     if (n >= 4096) {
-        ntt_tile_kernel<<<dim3(n / 4096, channels), 256>>>(data, twiddles, primes, nprime, n, channels);
+        ntt_tile_kernel<<<dim3(n / 4096, channels), threads>>>(data, twiddles, shoups, primes, n, channels);
         stride = 4096;
+    } else {
+        bitrev_kernel<<<dim3((n + threads - 1) / threads, channels), threads>>>(data, n, bits, channels);
     }
     while (stride * 8 <= n) {
         radix8_kernel<<<dim3((n / 8 + threads - 1) / threads, channels), threads>>>(
-            data, twiddles, primes, nprime, n, stride, channels, bits, 0);
+            data, twiddles, shoups, primes, n, stride, channels, bits, 0);
         stride <<= 3;
     }
     for (int half = stride; half < n; half <<= 1) {
         const int butterflies = n / 2;
         stage_kernel<<<dim3((butterflies + threads - 1) / threads, channels), threads>>>(
-            data, twiddles, primes, nprime, n, half, half - 1, channels);
+            data, twiddles, shoups, primes, n, half, half - 1, channels);
     }
 }
 
 void inverse_ntt(
-    uint64_t* data, const uint64_t* twiddles, const uint64_t* primes, const uint64_t* nprime,
+    uint64_t* data, const uint64_t* twiddles, const uint64_t* shoups, const uint64_t* primes,
     int n, int channels) {
-    forward_ntt(data, twiddles, primes, nprime, n, channels);
+    forward_ntt(data, twiddles, shoups, primes, n, channels);
 }
 
 }  // namespace
@@ -930,6 +1050,41 @@ void barrett_mu_1088(const uint32_t* q, int q_limbs, uint32_t* mu) {
     for (int i = 0; i < 8; ++i) mu[i] = 0;
     for (int bit = 1088; bit >= 0; --bit) {
         uint32_t carry = bit == 1088 ? 1u : 0u;
+        for (int limb = 0; limb < 40; ++limb) {
+            const uint32_t next = (rem[limb] << 1) | carry;
+            carry = rem[limb] >> 31;
+            rem[limb] = next;
+        }
+        int cmp = 0;
+        for (int limb = 39; limb >= 0; --limb) {
+            const uint32_t q_limb = limb < q_limbs ? q[limb] : 0u;
+            if (rem[limb] == q_limb) continue;
+            cmp = rem[limb] > q_limb ? 1 : -1;
+            break;
+        }
+        if (cmp < 0) continue;
+        uint32_t borrow = 0;
+        for (int limb = 0; limb < 40; ++limb) {
+            const uint64_t right = static_cast<uint64_t>(limb < q_limbs ? q[limb] : 0u) + borrow;
+            if (rem[limb] < right) {
+                rem[limb] = static_cast<uint32_t>(static_cast<uint64_t>(rem[limb]) + (1ull << 32) - right);
+                borrow = 1;
+            } else {
+                rem[limb] = static_cast<uint32_t>(rem[limb] - right);
+                borrow = 0;
+            }
+        }
+        const int word = bit >> 5;
+        if (word < 8) mu[word] |= 1u << (bit & 31);
+    }
+}
+
+// mu = floor(2^(868+128) / q). The challenge modulus is 868 bits, 27 limbs plus 4 bits.
+void barrett_mu_996(const uint32_t* q, int q_limbs, uint32_t* mu) {
+    uint32_t rem[40] = {};
+    for (int i = 0; i < 8; ++i) mu[i] = 0;
+    for (int bit = 996; bit >= 0; --bit) {
+        uint32_t carry = bit == 996 ? 1u : 0u;
         for (int limb = 0; limb < 40; ++limb) {
             const uint32_t next = (rem[limb] << 1) | carry;
             carry = rem[limb] >> 31;
@@ -1052,6 +1207,8 @@ void* fherma_init(const fherma::Point& point) {
     const int n = static_cast<int>(point.N);
     std::vector<uint64_t> tw_fwd(static_cast<size_t>(channels) * n);
     std::vector<uint64_t> tw_inv(static_cast<size_t>(channels) * n);
+    std::vector<uint64_t> tw_fwd_shoup(static_cast<size_t>(channels) * n);
+    std::vector<uint64_t> tw_inv_shoup(static_cast<size_t>(channels) * n);
     std::vector<uint64_t> psi(static_cast<size_t>(channels) * n);
     std::vector<uint64_t> psi_inv(static_cast<size_t>(channels) * n);
     std::vector<uint64_t> ninv(channels);
@@ -1084,8 +1241,16 @@ void* fherma_init(const fherma::Point& point) {
             uint64_t twiddle = 1;
             uint64_t twiddle_inv = 1;
             for (int lane = 0; lane < half; ++lane) {
-                tw_fwd[static_cast<size_t>(channel) * n + (half - 1) + lane] = twiddle;
-                tw_inv[static_cast<size_t>(channel) * n + (half - 1) + lane] = twiddle_inv;
+                const size_t tw_at = static_cast<size_t>(channel) * n + (half - 1) + lane;
+                tw_fwd[tw_at] = twiddle;
+                tw_inv[tw_at] = twiddle_inv;
+                uint64_t shoup_hi = 0;
+                uint64_t shoup_lo = 0;
+                uint64_t shoup_rem = 0;
+                div_u128(twiddle, 0, prime, shoup_hi, shoup_lo, shoup_rem);
+                tw_fwd_shoup[tw_at] = shoup_lo;
+                div_u128(twiddle_inv, 0, prime, shoup_hi, shoup_lo, shoup_rem);
+                tw_inv_shoup[tw_at] = shoup_lo;
                 twiddle = mul_mod(twiddle, step_root, prime);
                 twiddle_inv = mul_mod(twiddle_inv, step_inv, prime);
             }
@@ -1105,8 +1270,6 @@ void* fherma_init(const fherma::Point& point) {
             const size_t at = static_cast<size_t>(channel) * n + index;
             psi[at] = mont_mul(psi[at], lift, prime, np);
             psi_inv[at] = mont_mul(psi_inv[at], lift, prime, np);
-            tw_fwd[at] = mont_mul(tw_fwd[at], lift, prime, np);
-            tw_inv[at] = mont_mul(tw_inv[at], lift, prime, np);
         }
         ninv[channel] = mont_mul(ninv[channel], lift, prime, np);
         for (int limb = 0; limb < kWide; ++limb) m_before[static_cast<size_t>(channel) * kWide + limb] = running[limb];
@@ -1117,6 +1280,37 @@ void* fherma_init(const fherma::Point& point) {
         uint32_t grown[kWide] = {};
         add_mul_u64(grown, running, prime, kWide);
         for (int limb = 0; limb < kWide; ++limb) running[limb] = grown[limb];
+    }
+
+    {
+        const uint64_t prime = primes[0];
+        const uint64_t np = nprime_table[0];
+        const uint64_t lift = r2_table[0];
+        for (int trial = 0; trial < 32; ++trial) {
+            uint64_t left = (static_cast<uint64_t>(trial) * 0x9E3779B97F4A7C15ull) % prime;
+            uint64_t right = ((static_cast<uint64_t>(trial) + 3ull) * 0xBF58476D1CE4E5B9ull) % prime;
+            if (right == 0) right = 1;
+            uint64_t shoup_hi = 0;
+            uint64_t shoup_lo = 0;
+            uint64_t shoup_rem = 0;
+            div_u128(right, 0, prime, shoup_hi, shoup_lo, shoup_rem);
+            const uint64_t left_m = mont_mul(left, lift, prime, np);
+            const uint64_t right_m = mont_mul(right, lift, prime, np);
+            uint64_t quot_hi = 0;
+            uint64_t quot_lo = 0;
+            uint64_t aw_hi = 0;
+            uint64_t aw_lo = 0;
+            uint64_t qp_hi = 0;
+            uint64_t qp_lo = 0;
+            mul64_wide(left_m, shoup_lo, quot_hi, quot_lo);
+            mul64_wide(left_m, right, aw_hi, aw_lo);
+            mul64_wide(quot_hi, prime, qp_hi, qp_lo);
+            uint64_t got = aw_lo - qp_lo;
+            if (got >= prime) got -= prime;
+            if (got != mont_mul(left_m, right_m, prime, np)) {
+                throw std::runtime_error("Shoup multiply does not match Montgomery");
+            }
+        }
     }
 
     uint32_t half_m[kWide];
@@ -1199,13 +1393,34 @@ void* fherma_init(const fherma::Point& point) {
         }
     }
 
+    uint32_t q_mu_host[8] = {};
+    if (point.L == 28) {
+        barrett_mu_996(q_limbs, static_cast<int>(point.L), q_mu_host);
+        uint32_t slow[kCrtLimbs];
+        uint32_t fast[kCrtLimbs];
+        for (int limb = 0; limb < kCrtLimbs; ++limb) {
+            const uint32_t base = limb < static_cast<int>(point.L) ? q_limbs[limb] : 0u;
+            slow[limb] = base + static_cast<uint32_t>(limb * 97u + 11u);
+            fast[limb] = slow[limb];
+        }
+        slow[30] = 0x3ffffu;
+        fast[30] = 0x3ffffu;
+        mod_q(slow, q_limbs, static_cast<int>(point.L), kCrtLimbs);
+        mod_q_barrett(fast, q_limbs, q_mu_host, static_cast<int>(point.L));
+        for (int limb = 0; limb < kCrtLimbs; ++limb) {
+            if (slow[limb] != fast[limb]) {
+                throw std::runtime_error("Barrett reduction does not match division");
+            }
+        }
+    }
+
     auto* state = new State();
     state->N = n;
     state->L = static_cast<int>(point.L);
     state->channels = channels;
     const size_t row = static_cast<size_t>(channels) * n;
     try {
-        check_cuda(cudaDeviceSetLimit(cudaLimitStackSize, 16384), "stack");
+        check_cuda(cudaDeviceSetLimit(cudaLimitStackSize, 65536), "stack");
         check_cuda(cudaMalloc(&state->d_prime, primes.size() * sizeof(uint64_t)), "primes");
         check_cuda(cudaMalloc(&state->d_nprime, nprime_table.size() * sizeof(uint64_t)), "nprime");
         check_cuda(cudaMalloc(&state->d_r2, r2_table.size() * sizeof(uint64_t)), "r2");
@@ -1216,6 +1431,8 @@ void* fherma_init(const fherma::Point& point) {
         check_cuda(cudaMalloc(&state->d_b, row * sizeof(uint64_t)), "b");
         check_cuda(cudaMalloc(&state->d_tw_fwd, row * sizeof(uint64_t)), "twiddles");
         check_cuda(cudaMalloc(&state->d_tw_inv, row * sizeof(uint64_t)), "inverse twiddles");
+        check_cuda(cudaMalloc(&state->d_tw_fwd_shoup, row * sizeof(uint64_t)), "twiddle shoup");
+        check_cuda(cudaMalloc(&state->d_tw_inv_shoup, row * sizeof(uint64_t)), "inverse twiddle shoup");
         check_cuda(cudaMalloc(&state->d_psi, row * sizeof(uint64_t)), "psi");
         check_cuda(cudaMalloc(&state->d_psi_inv, row * sizeof(uint64_t)), "psi inverse");
         check_cuda(cudaMalloc(&state->d_in, static_cast<size_t>(n) * point.L * sizeof(uint32_t)), "input");
@@ -1226,6 +1443,11 @@ void* fherma_init(const fherma::Point& point) {
         check_cuda(cudaMalloc(&state->d_half_m, kWide * sizeof(uint32_t)), "half modulus");
         check_cuda(cudaMalloc(&state->d_m_mod_q, kWide * sizeof(uint32_t)), "modulus residue");
         check_cuda(cudaMalloc(&state->d_q, kWide * sizeof(uint32_t)), "q");
+        check_cuda(cudaMalloc(&state->d_q_mu, 8 * sizeof(uint32_t)), "q barrett");
+        const size_t host_bytes = static_cast<size_t>(n) * point.L * sizeof(uint32_t);
+        check_cuda(cudaMallocHost(&state->h_pin_a, host_bytes), "pinned a");
+        check_cuda(cudaMallocHost(&state->h_pin_b, host_bytes), "pinned b");
+        check_cuda(cudaMallocHost(&state->h_pin_c, host_bytes), "pinned c");
         check_cuda(cudaMalloc(&state->d_crt_y, crt_y.size() * sizeof(uint64_t)), "crt digits");
         check_cuda(cudaMalloc(&state->d_magic_lo, magic_lo.size() * sizeof(uint64_t)), "crt reciprocal");
         check_cuda(cudaMalloc(&state->d_magic_hi, magic_hi.size() * sizeof(uint64_t)), "crt reciprocal high");
@@ -1241,6 +1463,8 @@ void* fherma_init(const fherma::Point& point) {
         check_cuda(cudaMemcpy(state->d_ninv, ninv.data(), ninv.size() * sizeof(uint64_t), cudaMemcpyHostToDevice), "ninv");
         check_cuda(cudaMemcpy(state->d_tw_fwd, tw_fwd.data(), row * sizeof(uint64_t), cudaMemcpyHostToDevice), "twiddles");
         check_cuda(cudaMemcpy(state->d_tw_inv, tw_inv.data(), row * sizeof(uint64_t), cudaMemcpyHostToDevice), "inverse twiddles");
+        check_cuda(cudaMemcpy(state->d_tw_fwd_shoup, tw_fwd_shoup.data(), row * sizeof(uint64_t), cudaMemcpyHostToDevice), "twiddle shoup");
+        check_cuda(cudaMemcpy(state->d_tw_inv_shoup, tw_inv_shoup.data(), row * sizeof(uint64_t), cudaMemcpyHostToDevice), "inverse twiddle shoup");
         check_cuda(cudaMemcpy(state->d_psi, psi.data(), row * sizeof(uint64_t), cudaMemcpyHostToDevice), "psi");
         check_cuda(cudaMemcpy(state->d_psi_inv, psi_inv.data(), row * sizeof(uint64_t), cudaMemcpyHostToDevice), "psi inverse");
         check_cuda(cudaMemcpy(state->d_mbefore, m_before.data(), m_before.size() * sizeof(uint32_t), cudaMemcpyHostToDevice), "garner");
@@ -1249,6 +1473,7 @@ void* fherma_init(const fherma::Point& point) {
         check_cuda(cudaMemcpy(state->d_half_m, half_m, kWide * sizeof(uint32_t), cudaMemcpyHostToDevice), "half modulus");
         check_cuda(cudaMemcpy(state->d_m_mod_q, m_mod_q, kWide * sizeof(uint32_t), cudaMemcpyHostToDevice), "modulus residue");
         check_cuda(cudaMemcpy(state->d_q, q_limbs, kWide * sizeof(uint32_t), cudaMemcpyHostToDevice), "q");
+        check_cuda(cudaMemcpy(state->d_q_mu, q_mu_host, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice), "q barrett");
         check_cuda(cudaMemcpy(state->d_crt_y, crt_y.data(), crt_y.size() * sizeof(uint64_t), cudaMemcpyHostToDevice), "crt digits");
         check_cuda(cudaMemcpy(state->d_magic_lo, magic_lo.data(), magic_lo.size() * sizeof(uint64_t), cudaMemcpyHostToDevice), "crt reciprocal");
         check_cuda(cudaMemcpy(state->d_magic_hi, magic_hi.data(), magic_hi.size() * sizeof(uint64_t), cudaMemcpyHostToDevice), "crt reciprocal high");
@@ -1270,19 +1495,21 @@ fherma::Outputs fherma_run(void* raw, const fherma::Inputs& input) {
     const int threads = 128;
     const dim3 coeff_grid((state->N + threads - 1) / threads, state->channels);
     const size_t bytes = count * sizeof(uint32_t);
-    check_cuda(cudaMemcpy(state->d_in, input.a.data.data(), bytes, cudaMemcpyHostToDevice), "a copy");
+    std::memcpy(state->h_pin_a, input.a.data.data(), bytes);
+    check_cuda(cudaMemcpyAsync(state->d_in, state->h_pin_a, bytes, cudaMemcpyHostToDevice), "a copy");
     launch_residues(
         coeff_grid, threads, state->d_in, state->d_a, state->d_psi, state->d_prime, state->d_nprime, state->d_r2,
         state->d_mu, state->d_pow32, state->d_magic_lo, state->d_magic_hi, state->N, state->L, state->channels);
-    check_cuda(cudaMemcpy(state->d_in, input.b.data.data(), bytes, cudaMemcpyHostToDevice), "b copy");
+    std::memcpy(state->h_pin_b, input.b.data.data(), bytes);
+    check_cuda(cudaMemcpyAsync(state->d_in, state->h_pin_b, bytes, cudaMemcpyHostToDevice), "b copy");
     launch_residues(
         coeff_grid, threads, state->d_in, state->d_b, state->d_psi, state->d_prime, state->d_nprime, state->d_r2,
         state->d_mu, state->d_pow32, state->d_magic_lo, state->d_magic_hi, state->N, state->L, state->channels);
-    forward_ntt(state->d_a, state->d_tw_fwd, state->d_prime, state->d_nprime, state->N, state->channels);
-    forward_ntt(state->d_b, state->d_tw_fwd, state->d_prime, state->d_nprime, state->N, state->channels);
+    forward_ntt(state->d_a, state->d_tw_fwd, state->d_tw_fwd_shoup, state->d_prime, state->N, state->channels);
+    forward_ntt(state->d_b, state->d_tw_fwd, state->d_tw_fwd_shoup, state->d_prime, state->N, state->channels);
     pointwise_kernel<<<coeff_grid, threads>>>(
         state->d_a, state->d_b, state->d_prime, state->d_nprime, state->N, state->channels);
-    inverse_ntt(state->d_a, state->d_tw_inv, state->d_prime, state->d_nprime, state->N, state->channels);
+    inverse_ntt(state->d_a, state->d_tw_inv, state->d_tw_inv_shoup, state->d_prime, state->N, state->channels);
     untwist_kernel<<<coeff_grid, threads>>>(
         state->d_a, state->d_psi_inv, state->d_ninv, state->d_prime, state->d_nprime, state->N, state->channels);
     fast_crt_kernel<<<(state->N + threads - 1) / threads, threads>>>(
@@ -1290,12 +1517,13 @@ fherma::Outputs fherma_run(void* raw, const fherma::Inputs& input) {
         state->d_magic_hi, state->d_mi_q, state->d_m_mod_q, state->d_q, state->d_q_mu, state->d_unsafe_count,
         state->d_unsafe_index, state->N, state->channels, state->L);
     check_cuda(cudaGetLastError(), "launch");
+    check_cuda(cudaMemcpyAsync(state->h_pin_c, state->d_out, bytes, cudaMemcpyDeviceToHost), "c copy");
     check_cuda(cudaDeviceSynchronize(), "sync");
 
     fherma::Outputs output;
     output.c.shape = {state->N, state->L};
     output.c.data.resize(count);
-    check_cuda(cudaMemcpy(output.c.data.data(), state->d_out, bytes, cudaMemcpyDeviceToHost), "c copy");
+    std::memcpy(output.c.data.data(), state->h_pin_c, bytes);
     return output;
 }
 
@@ -1312,6 +1540,11 @@ void fherma_free(void* raw) {
     cudaFree(state->d_b);
     cudaFree(state->d_tw_fwd);
     cudaFree(state->d_tw_inv);
+    cudaFree(state->d_tw_fwd_shoup);
+    cudaFree(state->d_tw_inv_shoup);
+    cudaFreeHost(state->h_pin_a);
+    cudaFreeHost(state->h_pin_b);
+    cudaFreeHost(state->h_pin_c);
     cudaFree(state->d_psi);
     cudaFree(state->d_psi_inv);
     cudaFree(state->d_in);
